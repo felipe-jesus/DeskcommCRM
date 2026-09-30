@@ -1,0 +1,142 @@
+# DeskcommCRM — stack para COOLIFY.
+#
+# Derivado de docker-compose.prod.yml + docker-compose.traefik.yml do projeto.
+# Diferenças em relação ao original:
+#   - sem Caddy: o Traefik do Coolify cuida do HTTPS e das portas 80/443;
+#   - sem os módulos opcionais de voz (wacalls, asterisk, voice-agent);
+#   - sem `build:` (as imagens já estão publicadas no ghcr.io);
+#   - sem redes customizadas: o Coolify liga o proxy à rede da própria stack.
+#
+# NO COOLIFY
+#   1. Domains -> serviço `app` -> https://SEU.DOMINIO:3000
+#   2. Environment Variables -> DOMAIN=SEU.DOMINIO (usado na regra de bloqueio
+#      abaixo) e as demais variáveis do .env.example do projeto.
+#   3. NÃO ative "Connect to Predefined Network": o redis roda sem senha e
+#      ficaria visível para outros recursos da mesma rede.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  app:
+    mem_limit: 768m
+    image: ${APP_IMAGE:-ghcr.io/melgarafael/deskcommcrm:stable}
+    pull_policy: ${APP_PULL_POLICY:-always}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SUPABASE_DB_ADMIN_URL: ""
+    depends_on:
+      srh:
+        condition: service_started
+      waha:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    logging: *default-logging
+    labels:
+      # A rota principal (host, HTTPS, redirect) o Coolify gera a partir do
+      # domínio configurado na aba Domains. Aqui só entra o que ele não gera:
+      # o equivalente ao `respond @waha_global 403` do Caddyfile.
+      #
+      # O webhook GLOBAL do WAHA não pode ser alcançável pela internet: quem
+      # soubesse o endereço injetaria mensagens falsas no CRM. Dentro da stack o
+      # WAHA fala com o app pela rede do Docker, então essa rota nunca precisou
+      # ser pública. O Traefik não tem "responda 403"; o equivalente é um
+      # ipallowlist com uma única faixa que nenhum cliente real tem
+      # (192.0.2.1/32, TEST-NET-1). A prioridade alta faz esta rota vencer a
+      # principal.
+      #
+      # `https` e `letsencrypt` são os nomes padrão do Traefik do Coolify. Se o
+      # seu usar outros, defina TRAEFIK_ENTRYPOINT e TRAEFIK_CERTRESOLVER.
+      - "traefik.enable=true"
+      - "traefik.http.services.deskcomm.loadbalancer.server.port=3000"
+      - "traefik.http.routers.deskcomm-waha-block.rule=Host(`${DOMAIN}`) && Path(`/api/v1/webhooks/waha`)"
+      - "traefik.http.routers.deskcomm-waha-block.entrypoints=${TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.deskcomm-waha-block.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.deskcomm-waha-block.priority=1000"
+      - "traefik.http.routers.deskcomm-waha-block.service=deskcomm"
+      - "traefik.http.routers.deskcomm-waha-block.middlewares=deskcomm-deny"
+      - "traefik.http.middlewares.deskcomm-deny.ipallowlist.sourcerange=192.0.2.1/32"
+
+  worker:
+    mem_limit: 512m
+    image: ${WORKER_IMAGE:-ghcr.io/melgarafael/deskcomm-worker:stable}
+    pull_policy: ${WORKER_PULL_POLICY:-always}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WAHA_API_BASE_URL: http://waha:3000
+      SUPABASE_DB_ADMIN_URL: ""
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  waha:
+    mem_limit: 1280m
+    image: ${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}
+    restart: unless-stopped
+    environment:
+      # O prefixo sha512: faz o WAHA comparar o hash do X-Api-Key recebido com
+      # este valor. WAHA_API_KEY_SHA512 é o SHA-512 (hex) da chave em texto puro.
+      WAHA_API_KEY: "sha512:${WAHA_API_KEY_SHA512}"
+      WHATSAPP_HOOK_URL: ${WAHA_WEBHOOK_BASE_URL}/api/v1/webhooks/waha
+      WHATSAPP_HOOK_EVENTS: "message.any,message.ack,message.edited,message.revoked,session.status,state.change"
+      WHATSAPP_HOOK_HMAC: ${WAHA_HMAC_SECRET}
+      WHATSAPP_DEFAULT_ENGINE: ${WHATSAPP_DEFAULT_ENGINE:-NOWEB}
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_RESTART_ALL_SESSIONS: "${WHATSAPP_RESTART_ALL_SESSIONS:-True}"
+    volumes:
+      - waha-data:/app/.sessions
+      - waha-media:/app/.media
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging: *default-logging
+
+  srh:
+    image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+    restart: unless-stopped
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${SRH_TOKEN}
+      SRH_CONNECTION_STRING: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+
+  scheduler:
+    image: ${SCHEDULER_IMAGE:-ghcr.io/melgarafael/deskcomm-scheduler:stable}
+    pull_policy: ${SCHEDULER_PULL_POLICY:-always}
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      INTERNAL_SECRET: ${INTERNAL_SECRET}
+    logging: *default-logging
+
+volumes:
+  waha-data:
+  waha-media:
